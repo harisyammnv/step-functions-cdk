@@ -1,0 +1,71 @@
+from aws_cdk import (
+    aws_stepfunctions as _aws_stepfunctions,
+    aws_stepfunctions_tasks as _aws_stepfunctions_tasks,
+    aws_lambda as _lambda,
+    core,
+)
+
+
+class JobPollerStack(core.Stack):
+    def __init__(self, app: core.App, id: str, **kwargs) -> None:
+        super().__init__(app, id, **kwargs)
+
+        # Lambda Handlers Definitions
+
+        submit_lambda = _lambda.Function(self, 'submitLambda',
+                                         handler='start_processing_job.lambda_handler',
+                                         runtime=_lambda.Runtime.PYTHON_3_8,
+                                         code=_lambda.Code.asset('lambda/submit'))
+
+        status_lambda = _lambda.Function(self, 'statusLambda',
+                                         handler='get_processing_job_status.lambda_handler',
+                                         runtime=_lambda.Runtime.PYTHON_3_8,
+                                         code=_lambda.Code.asset('lambda/status'))
+
+        # Step functions Definition
+
+        submit_job = _aws_stepfunctions_tasks.LambdaInvoke(
+            self, "Submit Job",
+            lambda_function=submit_lambda,
+            output_path="$.Payload",
+        )
+
+        wait_job = _aws_stepfunctions.Wait(
+            self, "Wait 30 Seconds",
+            time=_aws_stepfunctions.WaitTime.duration(
+                core.Duration.seconds(30))
+        )
+
+        status_job = _aws_stepfunctions_tasks.LambdaInvoke(
+            self, "Get Status",
+            lambda_function=status_lambda,
+            output_path="$.Payload",
+        )
+
+        fail_job = _aws_stepfunctions.Fail(
+            self, "Fail",
+            cause='AWS Batch Job Failed',
+            error='DescribeJob returned FAILED'
+        )
+
+        succeed_job = _aws_stepfunctions.Succeed(
+            self, "Succeeded",
+            comment='AWS Batch Job succeeded'
+        )
+
+        # Create Chain
+
+        definition = submit_job.next(wait_job)\
+            .next(status_job)\
+            .next(_aws_stepfunctions.Choice(self, 'Job Complete?')
+                  .when(_aws_stepfunctions.Condition.string_equals('$.status', 'WAIT'), wait_job)
+                  .when(_aws_stepfunctions.Condition.string_equals('$.status', 'FAILED'), fail_job)
+                  .when(_aws_stepfunctions.Condition.string_equals('$.status', 'SUCCEEDED'), succeed_job)
+                  .otherwise(wait_job))
+
+        # Create state machine
+        sm = _aws_stepfunctions.StateMachine(
+            self, "StateMachine",
+            definition=definition,
+            timeout=core.Duration.minutes(15),
+        )
